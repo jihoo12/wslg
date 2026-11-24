@@ -1,4 +1,4 @@
-From 1f60c2f193d0f7fa81d492185edcb74895d5728a Mon Sep 17 00:00:00 2001
+From 05fc693bc2da78089222d287c89fae50f932c274 Mon Sep 17 00:00:00 2001
 From: Yoi <yoi@users.noreply.github.com>
 Date: Tue, 24 Nov 2026 13:58:51 +0900
 Subject: [PATCH] Add opt-in D3D12 GLES2 render targets for nested wl_shm
@@ -6,12 +6,12 @@ Subject: [PATCH] Add opt-in D3D12 GLES2 render targets for nested wl_shm
 
 ---
  include/render/gles2.h              |   6 +
- include/render/gles2/shm-readback.h |  49 ++++++++
+ include/render/gles2/shm-readback.h |  49 +++++++
  render/gles2/pass.c                 |   6 +-
- render/gles2/renderer.c             | 183 +++++++++++++++++++++++++---
+ render/gles2/renderer.c             | 204 +++++++++++++++++++++++++---
  render/wlr_renderer.c               |  19 +++
  tests/d3d12-shm-readback.c          |  24 ++++
- 6 files changed, 269 insertions(+), 18 deletions(-)
+ 6 files changed, 290 insertions(+), 18 deletions(-)
  create mode 100644 include/render/gles2/shm-readback.h
  create mode 100644 tests/d3d12-shm-readback.c
 
@@ -119,7 +119,7 @@ index a70ea13..a4efffc 100644
  		if (sync == EGL_NO_SYNC_KHR) {
  			goto out;
 diff --git a/render/gles2/renderer.c b/render/gles2/renderer.c
-index e362dae..1dd89f5 100644
+index e362dae..427f82c 100644
 --- a/render/gles2/renderer.c
 +++ b/render/gles2/renderer.c
 @@ -5,6 +5,8 @@
@@ -362,7 +362,7 @@ index e362dae..1dd89f5 100644
  
  	int drm_fd = wlr_renderer_get_drm_fd(&renderer->wlr_renderer);
  	uint64_t cap_syncobj_timeline;
-@@ -711,6 +799,67 @@ error:
+@@ -711,6 +799,88 @@ error:
  	return NULL;
  }
  
@@ -379,25 +379,46 @@ index e362dae..1dd89f5 100644
 +
 +	EGLDisplay display = eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA,
 +		EGL_DEFAULT_DISPLAY, NULL);
-+	if (display == EGL_NO_DISPLAY || !eglInitialize(display, NULL, NULL)) {
-+		wlr_log(WLR_ERROR, "D3D12 SHM: surfaceless EGL initialization failed");
++	if (display == EGL_NO_DISPLAY) {
++		wlr_log(WLR_ERROR, "D3D12 SHM: eglGetPlatformDisplay(SURFACELESS_MESA) "
++			"failed with EGL error 0x%04x", eglGetError());
 +		return NULL;
 +	}
++	EGLint major, minor;
++	if (!eglInitialize(display, &major, &minor)) {
++		wlr_log(WLR_ERROR, "D3D12 SHM: eglInitialize(SURFACELESS_MESA) failed "
++			"with EGL error 0x%04x; try SHADY_D3D12_DEBUG=1", eglGetError());
++		return NULL;
++	}
++	const char *vendor = eglQueryString(display, EGL_VENDOR);
++	wlr_log(WLR_INFO, "D3D12 SHM: EGL %d.%d vendor %s", (int)major, (int)minor,
++		vendor ? vendor : "<unknown>");
 +	EGLContext context = EGL_NO_CONTEXT;
 +	if (!eglBindAPI(EGL_OPENGL_ES_API)) {
++		wlr_log(WLR_ERROR, "D3D12 SHM: eglBindAPI failed with EGL error 0x%04x", eglGetError());
 +		goto fail;
 +	}
 +	const EGLint config_attrs[] = { EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
 +		EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_NONE };
 +	EGLConfig config;
 +	EGLint count;
-+	if (!eglChooseConfig(display, config_attrs, &config, 1, &count) || count != 1) {
++	if (!eglChooseConfig(display, config_attrs, &config, 1, &count)) {
++		wlr_log(WLR_ERROR, "D3D12 SHM: eglChooseConfig failed with EGL error 0x%04x", eglGetError());
++		goto fail;
++	}
++	if (count != 1) {
++		wlr_log(WLR_ERROR, "D3D12 SHM: EGL exposes no GLES2 pbuffer config");
 +		goto fail;
 +	}
 +	const EGLint context_attrs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
 +	context = eglCreateContext(display, config, EGL_NO_CONTEXT, context_attrs);
-+	if (context == EGL_NO_CONTEXT ||
-+			!eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, context)) {
++	if (context == EGL_NO_CONTEXT) {
++		wlr_log(WLR_ERROR, "D3D12 SHM: eglCreateContext failed with EGL error 0x%04x", eglGetError());
++		goto fail;
++	}
++	if (!eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, context)) {
++		wlr_log(WLR_ERROR, "D3D12 SHM: eglMakeCurrent(EGL_NO_SURFACE) failed "
++			"with EGL error 0x%04x", eglGetError());
 +		goto fail;
 +	}
 +	const char *name = (const char *)glGetString(GL_RENDERER);

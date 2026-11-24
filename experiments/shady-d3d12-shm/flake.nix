@@ -22,12 +22,12 @@
     compositor = (pkgs.callPackage "${shady}/nix/package.nix" { inherit wlroots; }).overrideAttrs (old: {
       patches = (old.patches or []) ++ [ ./shady-drop-failed-render-pass.patch ];
     });
-    runShady = pkgs.writeShellScript "shady-d3d12-shm" ''
-      unset LIBGL_ALWAYS_SOFTWARE MESA_LOADER_DRIVER_OVERRIDE
-      export WLR_BACKENDS=wayland WLR_RENDERER=gles2 WLR_GLES2_D3D12_SHM=1
-      export GALLIUM_DRIVER=d3d12
-      exec ${compositor}/bin/shady -s 'exec ${pkgs.foot}/bin/foot' "$@"
-    '';
+    runShady = pkgs.writeShellScript "shady-d3d12-shm" (
+      builtins.replaceStrings
+        [ "@mesa@" "@shady@" "@foot@" "@wsl-runtime@" ]
+        [ "${pkgs.mesa}" "${compositor}/bin/shady" "${pkgs.foot}/bin/foot" "/usr/lib/wsl/lib" ]
+        (builtins.readFile ./launch.sh)
+    );
   in {
     packages.${system} = {
       inherit compositor wlroots;

@@ -22,10 +22,19 @@ nix run --no-write-lock-file 'github:jihoo12/wslg?ref=yoi/shady-d3d12-shm&dir=ex
 The wrapper explicitly selects the Wayland backend and D3D12 GLES2 mode,
 then starts `foot` inside the new Shady window. Do not add `--safe`: it
 disables Shady's spatial effects. No global environment settings are
-changed. If the Nix-built process loads a different EGL vendor or Mesa
-from the probe, match its runtime loader to the working WSL setup before
-comparing the result. A non-D3D12 driver or no `/dev/dxg` fails explicitly;
-there is no quiet Pixman fallback with the opt-in.
+changed. By default the launcher selects the EGL manifest and DRI directory from
+the pinned Nix Mesa 26.1.8 derivation together, and adds only
+`/usr/lib/wsl/lib` for DXCore and D3D12 when both libraries exist.
+A non-D3D12 driver or no `/dev/dxg` fails explicitly; there is no quiet
+Pixman fallback with the opt-in.
+
+For EGL loader diagnostics, run the same command with `SHADY_D3D12_DEBUG=1`
+before `nix run`. The exact failing EGL call and numeric error are logged.
+The original offscreen probe may use a different Mesa (e.g. the user's
+distribution Mesa). The wrapper respects explicit EGL vendor/DRI
+environment settings. If overriding, use matching vendor and DRI globals
+from the same Mesa installation. Do not add the entire host library
+directory to `LD_LIBRARY_PATH` to force a match.
 
 Start from a pinned source pair: wlroots 0.20.2
 (`d783533489e1f75d6886c2ab5c5960090ef268f8`) and Shady
