@@ -1,0 +1,30 @@
+From 4ceb0ea1613828238b3098597301c57288b72144 Mon Sep 17 00:00:00 2001
+From: Yoi <yoi@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 13:58:51 +0900
+Subject: [PATCH] Drop stale output on render pass submission failure
+
+---
+ compositor/src/render/render.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/compositor/src/render/render.c b/compositor/src/render/render.c
+index 4dc4bc6..523d346 100644
+--- a/compositor/src/render/render.c
++++ b/compositor/src/render/render.c
+@@ -3750,6 +3750,13 @@ void shady_render_output_frame(
+ 			WLR_ERROR,
+ 			"failed to submit render pass"
+ 		);
++		/* Never present a stale target after a failed render/readback.
++		 * The damage ring has already rotated, so redraw the full next frame. */
++		output->damage_whole = true;
++		pixman_region32_fini(&frame_damage);
++		pixman_region32_fini(&redraw);
++		wlr_output_state_finish(&state);
++		return;
+ 	}
+ 	/* With stats on, wait for the GPU so submit_us is the frame's real cost. */
+ 	if ((renderer_is_software || profile) && plugin_make_current()) glFinish();
+-- 
+2.56.1
+

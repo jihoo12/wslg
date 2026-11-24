@@ -1,0 +1,509 @@
+From 1f60c2f193d0f7fa81d492185edcb74895d5728a Mon Sep 17 00:00:00 2001
+From: Yoi <yoi@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 13:58:51 +0900
+Subject: [PATCH] Add opt-in D3D12 GLES2 render targets for nested wl_shm
+ output
+
+---
+ include/render/gles2.h              |   6 +
+ include/render/gles2/shm-readback.h |  49 ++++++++
+ render/gles2/pass.c                 |   6 +-
+ render/gles2/renderer.c             | 183 +++++++++++++++++++++++++---
+ render/wlr_renderer.c               |  19 +++
+ tests/d3d12-shm-readback.c          |  24 ++++
+ 6 files changed, 269 insertions(+), 18 deletions(-)
+ create mode 100644 include/render/gles2/shm-readback.h
+ create mode 100644 tests/d3d12-shm-readback.c
+
+diff --git a/include/render/gles2.h b/include/render/gles2.h
+index 6b852dc..ed406e3 100644
+--- a/include/render/gles2.h
++++ b/include/render/gles2.h
+@@ -44,6 +44,8 @@ struct wlr_gles2_renderer {
+ 	int drm_fd;
+ 
+ 	struct wlr_drm_format_set shm_texture_formats;
++	struct wlr_drm_format_set shm_render_formats;
++	bool shm_readback;
+ 
+ 	const char *exts_str;
+ 	struct {
+@@ -103,6 +105,7 @@ struct wlr_gles2_buffer {
+ 	struct wlr_gles2_renderer *renderer;
+ 	struct wl_list link; // wlr_gles2_renderer.buffers
+ 	bool external_only;
++	uint8_t *rgba_readback; // Only for a SHM output target.
+ 
+ 	EGLImageKHR image;
+ 	GLuint rbo;
+@@ -149,6 +152,9 @@ const struct wlr_gles2_pixel_format *get_gles2_format_from_gl(
+ void get_gles2_shm_formats(const struct wlr_gles2_renderer *renderer,
+ 	struct wlr_drm_format_set *out);
+ 
++bool gles2_buffer_readback(struct wlr_gles2_buffer *buffer);
++struct wlr_renderer *gles2_create_d3d12_shm(void);
++
+ GLuint gles2_buffer_get_fbo(struct wlr_gles2_buffer *buffer);
+ 
+ struct wlr_gles2_renderer *gles2_get_renderer(
+diff --git a/include/render/gles2/shm-readback.h b/include/render/gles2/shm-readback.h
+new file mode 100644
+index 0000000..ec68252
+--- /dev/null
++++ b/include/render/gles2/shm-readback.h
+@@ -0,0 +1,49 @@
++#ifndef WLR_GLES2_SHM_READBACK_H
++#define WLR_GLES2_SHM_READBACK_H
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <string.h>
++#include <strings.h>
++
++static inline bool gles2_named_d3d12(const char *name) {
++    if (!name || strncasecmp(name, "D3D12 (", 7) != 0) {
++        return false;
++    }
++    size_t len = strlen(name);
++    if (len <= 8 || name[len - 1] != ')') {
++        return false;
++    }
++    const char *reject[] = {"warp", "microsoft basic", "software",
++        "llvmpipe", "softpipe", "unknown", NULL};
++    for (const char **p = reject; *p; ++p) {
++        size_t n = strlen(*p);
++        for (const char *s = name + 7; *s; ++s) {
++            if (strncasecmp(s, *p, n) == 0) {
++                return false;
++            }
++        }
++    }
++    return true;
++}
++
++static inline bool gles2_rgba_to_bgrx(void *dst, size_t stride,
++        const uint8_t *src, size_t width, size_t height, bool keep_alpha) {
++    if (!dst || !src || width == 0 || height == 0 || width > SIZE_MAX / 4 ||
++            stride < width * 4 || height > SIZE_MAX / stride) {
++        return false;
++    }
++    for (size_t y = 0; y < height; ++y) {
++        uint8_t *row = (uint8_t *)dst + y * stride;
++        for (size_t x = 0; x < width; ++x, src += 4, row += 4) {
++            // ARGB8888/XRGB8888 on little-endian WSL2 hosts.
++            row[0] = src[2];
++            row[1] = src[1];
++            row[2] = src[0];
++            row[3] = keep_alpha ? src[3] : 255;
++        }
++    }
++    return true;
++}
++
++#endif
+diff --git a/render/gles2/pass.c b/render/gles2/pass.c
+index a70ea13..a4efffc 100644
+--- a/render/gles2/pass.c
++++ b/render/gles2/pass.c
+@@ -39,7 +39,11 @@ static bool render_pass_submit(struct wlr_render_pass *wlr_pass) {
+ 		clock_gettime(CLOCK_MONOTONIC, &timer->cpu_end);
+ 	}
+ 
+-	if (pass->signal_timeline != NULL) {
++	if (pass->buffer->rgba_readback) {
++		if (pass->signal_timeline != NULL || !gles2_buffer_readback(pass->buffer)) {
++			goto out;
++		}
++	} else if (pass->signal_timeline != NULL) {
+ 		EGLSyncKHR sync = wlr_egl_create_sync(renderer->egl, -1);
+ 		if (sync == EGL_NO_SYNC_KHR) {
+ 			goto out;
+diff --git a/render/gles2/renderer.c b/render/gles2/renderer.c
+index e362dae..1dd89f5 100644
+--- a/render/gles2/renderer.c
++++ b/render/gles2/renderer.c
+@@ -5,6 +5,8 @@
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
+ #include <time.h>
+ #include <unistd.h>
+ #include <wayland-server-protocol.h>
+@@ -16,6 +18,7 @@
+ #include <wlr/util/log.h>
+ #include <xf86drm.h>
+ #include "render/egl.h"
++#include "render/gles2/shm-readback.h"
+ #include "render/gles2.h"
+ #include "render/pixel_format.h"
+ #include "util/time.h"
+@@ -69,6 +72,7 @@ static void destroy_buffer(struct wlr_gles2_buffer *buffer) {
+ 
+ 	wlr_egl_restore_context(&prev_ctx);
+ 
++	free(buffer->rgba_readback);
+ 	free(buffer);
+ }
+ 
+@@ -95,7 +99,7 @@ GLuint gles2_buffer_get_fbo(struct wlr_gles2_buffer *buffer) {
+ 
+ 	push_gles2_debug(buffer->renderer);
+ 
+-	if (!buffer->rbo) {
++	if (!buffer->rgba_readback && !buffer->rbo) {
+ 		glGenRenderbuffers(1, &buffer->rbo);
+ 		glBindRenderbuffer(GL_RENDERBUFFER, buffer->rbo);
+ 		buffer->renderer->procs.glEGLImageTargetRenderbufferStorageOES(GL_RENDERBUFFER,
+@@ -105,8 +109,13 @@ GLuint gles2_buffer_get_fbo(struct wlr_gles2_buffer *buffer) {
+ 
+ 	glGenFramebuffers(1, &buffer->fbo);
+ 	glBindFramebuffer(GL_FRAMEBUFFER, buffer->fbo);
+-	glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+-		GL_RENDERBUFFER, buffer->rbo);
++	if (buffer->rgba_readback) {
++		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
++			GL_TEXTURE_2D, buffer->tex, 0);
++	} else {
++		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
++			GL_RENDERBUFFER, buffer->rbo);
++	}
+ 	GLenum fb_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+ 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+ 
+@@ -138,15 +147,41 @@ struct wlr_gles2_buffer *gles2_buffer_get_or_create(struct wlr_gles2_renderer *r
+ 	buffer->buffer = wlr_buffer;
+ 	buffer->renderer = renderer;
+ 
+-	struct wlr_dmabuf_attributes dmabuf = {0};
+-	if (!wlr_buffer_get_dmabuf(wlr_buffer, &dmabuf)) {
+-		goto error_buffer;
+-	}
+-
+-	buffer->image = wlr_egl_create_image_from_dmabuf(renderer->egl,
+-		&dmabuf, &buffer->external_only);
+-	if (buffer->image == EGL_NO_IMAGE_KHR) {
+-		goto error_buffer;
++	if (renderer->shm_readback) {
++		struct wlr_shm_attributes shm;
++		int width = wlr_buffer->width, height = wlr_buffer->height;
++		GLint max_size;
++		glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_size);
++		if (!wlr_buffer_get_shm(wlr_buffer, &shm) ||
++				(shm.format != DRM_FORMAT_XRGB8888 && shm.format != DRM_FORMAT_ARGB8888) ||
++				width <= 0 || height <= 0 || width > max_size || height > max_size ||
++				(size_t)width > SIZE_MAX / 4 / (size_t)height) {
++			goto error_buffer;
++		}
++		buffer->rgba_readback = malloc((size_t)width * height * 4);
++		if (!buffer->rgba_readback) {
++			goto error_buffer;
++		}
++		GLint prev_texture;
++		glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_texture);
++		glGenTextures(1, &buffer->tex);
++		glBindTexture(GL_TEXTURE_2D, buffer->tex);
++		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0,
++			GL_RGBA, GL_UNSIGNED_BYTE, NULL);
++		glBindTexture(GL_TEXTURE_2D, (GLuint)prev_texture);
++		if (!buffer->tex || glGetError() != GL_NO_ERROR) {
++			goto error_buffer;
++		}
++	} else {
++		struct wlr_dmabuf_attributes dmabuf = {0};
++		if (!wlr_buffer_get_dmabuf(wlr_buffer, &dmabuf)) {
++			goto error_buffer;
++		}
++		buffer->image = wlr_egl_create_image_from_dmabuf(renderer->egl,
++			&dmabuf, &buffer->external_only);
++		if (buffer->image == EGL_NO_IMAGE_KHR) {
++			goto error_buffer;
++		}
+ 	}
+ 
+ 	wlr_addon_init(&buffer->addon, &wlr_buffer->addons, renderer,
+@@ -160,15 +195,47 @@ struct wlr_gles2_buffer *gles2_buffer_get_or_create(struct wlr_gles2_renderer *r
+ 	return buffer;
+ 
+ error_buffer:
++	glDeleteTextures(1, &buffer->tex);
++	free(buffer->rgba_readback);
+ 	free(buffer);
+ 	return NULL;
+ }
+ 
++bool gles2_buffer_readback(struct wlr_gles2_buffer *buffer) {
++	struct wlr_buffer *target = buffer->buffer;
++	void *dst;
++	uint32_t format;
++	size_t stride;
++	if (!wlr_buffer_begin_data_ptr_access(target, WLR_BUFFER_DATA_PTR_ACCESS_WRITE,
++			&dst, &format, &stride)) {
++		return false;
++	}
++	glBindFramebuffer(GL_FRAMEBUFFER, buffer->fbo);
++	GLint prev_pack;
++	glGetIntegerv(GL_PACK_ALIGNMENT, &prev_pack);
++	glPixelStorei(GL_PACK_ALIGNMENT, 4);
++	glReadPixels(0, 0, target->width, target->height, GL_RGBA, GL_UNSIGNED_BYTE,
++		buffer->rgba_readback);
++	glPixelStorei(GL_PACK_ALIGNMENT, prev_pack);
++
++	// Existing wlroots GLES/GBM passes arrange top as GL row 0. Preserve
++	// that same order rather than adding a glReadPixels-style Y flip.
++	bool ok = glGetError() == GL_NO_ERROR &&
++		(format == DRM_FORMAT_XRGB8888 || format == DRM_FORMAT_ARGB8888) &&
++		gles2_rgba_to_bgrx(dst, stride, buffer->rgba_readback, target->width,
++			target->height, format == DRM_FORMAT_ARGB8888);
++	wlr_buffer_end_data_ptr_access(target);
++	if (!ok) {
++		wlr_log(WLR_ERROR, "Failed to read back GLES2 output to wl_shm");
++	}
++	return ok;
++}
++
+ static const struct wlr_drm_format_set *gles2_get_texture_formats(
+ 		struct wlr_renderer *wlr_renderer, uint32_t buffer_caps) {
+ 	struct wlr_gles2_renderer *renderer = gles2_get_renderer(wlr_renderer);
+ 	if (buffer_caps & WLR_BUFFER_CAP_DMABUF) {
+-		return wlr_egl_get_dmabuf_texture_formats(renderer->egl);
++		return renderer->shm_readback ? NULL : wlr_egl_get_dmabuf_texture_formats(renderer->egl);
+ 	} else if (buffer_caps & WLR_BUFFER_CAP_DATA_PTR) {
+ 		return &renderer->shm_texture_formats;
+ 	} else {
+@@ -179,13 +246,17 @@ static const struct wlr_drm_format_set *gles2_get_texture_formats(
+ static const struct wlr_drm_format_set *gles2_get_render_formats(
+ 		struct wlr_renderer *wlr_renderer) {
+ 	struct wlr_gles2_renderer *renderer = gles2_get_renderer(wlr_renderer);
+-	return wlr_egl_get_dmabuf_render_formats(renderer->egl);
++	return renderer->shm_readback ? &renderer->shm_render_formats :
++		wlr_egl_get_dmabuf_render_formats(renderer->egl);
+ }
+ 
+ static int gles2_get_drm_fd(struct wlr_renderer *wlr_renderer) {
+ 	struct wlr_gles2_renderer *renderer =
+ 		gles2_get_renderer(wlr_renderer);
+ 
++	if (renderer->shm_readback) {
++		return -1;
++	}
+ 	if (renderer->drm_fd < 0) {
+ 		renderer->drm_fd = wlr_egl_dup_drm_fd(renderer->egl);
+ 	}
+@@ -230,6 +301,7 @@ static void gles2_destroy(struct wlr_renderer *wlr_renderer) {
+ 	wlr_egl_destroy(renderer->egl);
+ 
+ 	wlr_drm_format_set_finish(&renderer->shm_texture_formats);
++	wlr_drm_format_set_finish(&renderer->shm_render_formats);
+ 
+ 	if (renderer->drm_fd >= 0) {
+ 		close(renderer->drm_fd);
+@@ -255,12 +327,14 @@ static struct wlr_render_pass *gles2_begin_buffer_pass(struct wlr_renderer *wlr_
+ 
+ 	struct wlr_gles2_buffer *buffer = gles2_buffer_get_or_create(renderer, wlr_buffer);
+ 	if (!buffer) {
++		wlr_egl_restore_context(&prev_ctx);
+ 		return NULL;
+ 	}
+ 
+ 	struct wlr_gles2_render_pass *pass = begin_gles2_buffer_pass(buffer,
+ 		&prev_ctx, timer, options->signal_timeline, options->signal_point);
+ 	if (!pass) {
++		wlr_egl_restore_context(&prev_ctx);
+ 		return NULL;
+ 	}
+ 	return &pass->base;
+@@ -510,7 +584,7 @@ struct wlr_renderer *wlr_gles2_renderer_create_with_drm_fd(int drm_fd) {
+ 	return renderer;
+ }
+ 
+-struct wlr_renderer *wlr_gles2_renderer_create(struct wlr_egl *egl) {
++static struct wlr_renderer *gles2_renderer_create(struct wlr_egl *egl, bool shm) {
+ 	if (!wlr_egl_make_current(egl, NULL)) {
+ 		return NULL;
+ 	}
+@@ -525,7 +599,10 @@ struct wlr_renderer *wlr_gles2_renderer_create(struct wlr_egl *egl) {
+ 	if (renderer == NULL) {
+ 		return NULL;
+ 	}
+-	wlr_renderer_init(&renderer->wlr_renderer, &renderer_impl, WLR_BUFFER_CAP_DMABUF);
++	uint32_t target_caps = shm ? (WLR_BUFFER_CAP_SHM | WLR_BUFFER_CAP_DATA_PTR) :
++		WLR_BUFFER_CAP_DMABUF;
++	wlr_renderer_init(&renderer->wlr_renderer, &renderer_impl, target_caps);
++	renderer->shm_readback = shm;
+ 	renderer->wlr_renderer.features.output_color_transform = false;
+ 
+ 	wl_list_init(&renderer->buffers);
+@@ -541,7 +618,7 @@ struct wlr_renderer *wlr_gles2_renderer_create(struct wlr_egl *egl) {
+ 	wlr_log(WLR_INFO, "GL renderer: %s", glGetString(GL_RENDERER));
+ 	wlr_log(WLR_INFO, "Supported GLES2 extensions: %s", exts_str);
+ 
+-	if (!renderer->egl->exts.EXT_image_dma_buf_import) {
++	if (!shm && !renderer->egl->exts.EXT_image_dma_buf_import) {
+ 		wlr_log(WLR_ERROR, "EGL_EXT_image_dma_buf_import not supported");
+ 		free(renderer);
+ 		return NULL;
+@@ -682,6 +759,17 @@ struct wlr_renderer *wlr_gles2_renderer_create(struct wlr_egl *egl) {
+ 	wlr_egl_unset_current(renderer->egl);
+ 
+ 	get_gles2_shm_formats(renderer, &renderer->shm_texture_formats);
++	if (shm && (!wlr_drm_format_set_add(&renderer->shm_render_formats,
++			DRM_FORMAT_XRGB8888, DRM_FORMAT_MOD_INVALID) ||
++			!wlr_drm_format_set_add(&renderer->shm_render_formats,
++				DRM_FORMAT_ARGB8888, DRM_FORMAT_MOD_INVALID))) {
++		wlr_egl_make_current(egl, NULL);
++		push_gles2_debug(renderer);
++		wlr_drm_format_set_finish(&renderer->shm_render_formats);
++		wlr_drm_format_set_finish(&renderer->shm_texture_formats);
++		goto error;
++	}
++
+ 
+ 	int drm_fd = wlr_renderer_get_drm_fd(&renderer->wlr_renderer);
+ 	uint64_t cap_syncobj_timeline;
+@@ -711,6 +799,67 @@ error:
+ 	return NULL;
+ }
+ 
++struct wlr_renderer *wlr_gles2_renderer_create(struct wlr_egl *egl) {
++	return gles2_renderer_create(egl, false);
++}
++
++struct wlr_renderer *gles2_create_d3d12_shm(void) {
++	struct stat dxg;
++	if (stat("/dev/dxg", &dxg) < 0 || !S_ISCHR(dxg.st_mode)) {
++		wlr_log(WLR_ERROR, "D3D12 SHM requires the WSL /dev/dxg device");
++		return NULL;
++	}
++
++	EGLDisplay display = eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA,
++		EGL_DEFAULT_DISPLAY, NULL);
++	if (display == EGL_NO_DISPLAY || !eglInitialize(display, NULL, NULL)) {
++		wlr_log(WLR_ERROR, "D3D12 SHM: surfaceless EGL initialization failed");
++		return NULL;
++	}
++	EGLContext context = EGL_NO_CONTEXT;
++	if (!eglBindAPI(EGL_OPENGL_ES_API)) {
++		goto fail;
++	}
++	const EGLint config_attrs[] = { EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
++		EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_NONE };
++	EGLConfig config;
++	EGLint count;
++	if (!eglChooseConfig(display, config_attrs, &config, 1, &count) || count != 1) {
++		goto fail;
++	}
++	const EGLint context_attrs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
++	context = eglCreateContext(display, config, EGL_NO_CONTEXT, context_attrs);
++	if (context == EGL_NO_CONTEXT ||
++			!eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, context)) {
++		goto fail;
++	}
++	const char *name = (const char *)glGetString(GL_RENDERER);
++	if (!gles2_named_d3d12(name)) {
++		wlr_log(WLR_ERROR, "D3D12 SHM refused GL renderer: %s", name ? name : "<none>");
++		goto fail;
++	}
++	struct wlr_egl *egl = wlr_egl_create_with_context(display, context);
++	if (!egl) {
++		goto fail;
++	}
++	struct wlr_renderer *renderer = gles2_renderer_create(egl, true);
++	if (!renderer) {
++		wlr_egl_destroy(egl);
++		return NULL;
++	}
++	wlr_log(WLR_INFO, "D3D12 GLES2 active; using GPU readback to wl_shm");
++	return renderer;
++
++fail:
++	wlr_log(WLR_ERROR, "D3D12 SHM: cannot create a matching surfaceless GLES2 context");
++	if (context != EGL_NO_CONTEXT) {
++		eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++		eglDestroyContext(display, context);
++	}
++	eglTerminate(display);
++	return NULL;
++}
++
+ bool wlr_gles2_renderer_check_ext(struct wlr_renderer *wlr_renderer,
+ 		const char *ext) {
+ 	struct wlr_gles2_renderer *renderer = gles2_get_renderer(wlr_renderer);
+diff --git a/render/wlr_renderer.c b/render/wlr_renderer.c
+index e65314c..33ada34 100644
+--- a/render/wlr_renderer.c
++++ b/render/wlr_renderer.c
+@@ -2,6 +2,7 @@
+ #include <fcntl.h>
+ #include <stdbool.h>
+ #include <stdlib.h>
++#include <string.h>
+ #include <unistd.h>
+ #include <wlr/backend.h>
+ #include <wlr/render/interface.h>
+@@ -19,6 +20,7 @@
+ #if WLR_HAS_GLES2_RENDERER
+ #include <wlr/render/egl.h>
+ #include <wlr/render/gles2.h>
++#include "render/gles2.h"
+ #endif
+ 
+ #if WLR_HAS_VULKAN_RENDERER
+@@ -231,6 +233,23 @@ static struct wlr_renderer *renderer_autocreate(struct wlr_backend *backend, int
+ 
+ 	bool own_drm_fd = false;
+ 
++	if (env_parse_bool("WLR_GLES2_D3D12_SHM")) {
++		const char *backends = getenv("WLR_BACKENDS");
++		if (!backend || !backends || strcmp(backends, "wayland") != 0 ||
++				!(backend->buffer_caps & WLR_BUFFER_CAP_SHM) ||
++				(!is_auto && strcmp(renderer_name, "gles2") != 0)) {
++			wlr_log(WLR_ERROR, "D3D12 SHM requires WLR_BACKENDS=wayland, "
++				"parent wl_shm, and WLR_RENDERER=gles2 or auto");
++			return NULL;
++		}
++#if WLR_HAS_GLES2_RENDERER
++		return gles2_create_d3d12_shm();
++#else
++		wlr_log(WLR_ERROR, "D3D12 SHM requires GLES2 support");
++		return NULL;
++#endif
++	}
++
+ 	if ((is_auto && WLR_HAS_GLES2_RENDERER) || strcmp(renderer_name, "gles2") == 0) {
+ 		if (!open_preferred_drm_fd(backend, &drm_fd, &own_drm_fd)) {
+ 			log_creation_failure(is_auto, "Cannot create GLES2 renderer: no DRM FD available");
+diff --git a/tests/d3d12-shm-readback.c b/tests/d3d12-shm-readback.c
+new file mode 100644
+index 0000000..eebdeee
+--- /dev/null
++++ b/tests/d3d12-shm-readback.c
+@@ -0,0 +1,24 @@
++#include <assert.h>
++#include "render/gles2/shm-readback.h"
++
++int main(void) {
++    assert(gles2_named_d3d12("D3D12 (NVIDIA RTX A4000)"));
++    assert(!gles2_named_d3d12("llvmpipe (LLVM 19)"));
++    assert(!gles2_named_d3d12("D3D12 (Microsoft Basic Render Driver)"));
++    assert(!gles2_named_d3d12("D3D12 (WARP)"));
++    assert(!gles2_named_d3d12("D3D12 (Unknown)"));
++    assert(!gles2_named_d3d12("D3D12 ()"));
++    assert(!gles2_named_d3d12(NULL));
++    const uint8_t rgba[] = {200,20,10,111, 40,80,140,200};
++    uint8_t padded[16];
++    memset(padded, 7, sizeof(padded));
++    assert(gles2_rgba_to_bgrx(padded, 8, rgba, 1, 2, true));
++    const uint8_t expected[] = {10,20,200,111,7,7,7,7, 140,80,40,200,7,7,7,7};
++    assert(memcmp(padded, expected, sizeof(padded)) == 0);
++    assert(gles2_rgba_to_bgrx(padded, 4, rgba, 2, 1, true) == false);
++    assert(gles2_rgba_to_bgrx(padded, 8, rgba, 2, 1, false));
++    assert(padded[3] == 255 && padded[7] == 255);
++    assert(!gles2_rgba_to_bgrx(padded, 8, rgba, 0, 1, true));
++    assert(!gles2_rgba_to_bgrx(padded, SIZE_MAX, rgba, 1, 2, true));
++    return 0;
++}
+-- 
+2.56.1
+
